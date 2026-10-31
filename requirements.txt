@@ -1,0 +1,3 @@
+WannaCRI==0.3.3
+python-json-logger==2.0.7
+python-dotenv==1.2.4

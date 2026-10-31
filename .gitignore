@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local MovieData compressor data
+.env.*
+!.env.example
+output/
+output-*/
+.idea/
+.DS_Store

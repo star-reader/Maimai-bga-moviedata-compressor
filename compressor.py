@@ -23,15 +23,7 @@ import usm_io
 
 HERE = Path(__file__).resolve().parent
 STOP = threading.Event()
-REVISION = 1
-
-
-class BudgetError(ValueError):
-    """给下一步处理参数和说明"""
-
-    def __init__(self, message: str, attempts: list[dict]):
-        super().__init__(message)
-        self.attempts = attempts
+REVISION = 3
 
 
 def atomic_json(path: Path, data: object) -> None:
@@ -149,13 +141,77 @@ def next_budget(current: float, actual: float, target: float) -> float:
     return min(current * 0.9, current * target / actual * 0.95)
 
 
-def smaller_width(width: int, actual: float, target: float, minimum: int) -> int:
-    """按像素预算选择更低宽度，默认不会自己去调这个"""
-    if width <= minimum:
-        return width
-    predicted = min(width - 2, int(width * math.sqrt(target / actual) * 0.9) // 2 * 2)
-    tiers = [w for w in (960, 854, 720, 640, 480, 400) if minimum <= w <= predicted]
-    return max(tiers) if tiers else max(minimum, predicted)
+def scale_widths(source_width: int, settings: dict) -> list[int]:
+    floor = min(source_width, max(math.ceil(source_width * settings["min_scale"] / 2) * 2,
+                                  settings["min_width"]))
+    start = min(source_width, settings["width"] or source_width)
+    if start < floor:
+        raise ValueError("--width 低于自动缩放下限；请增大宽度或使用 --no-auto-scale")
+    widths = [start]
+    for ratio in (0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0):
+        width = max(floor, math.ceil(source_width * ratio / 2) * 2)
+        if width < widths[-1]:
+            widths.append(width)
+    return widths
+
+
+def encode_ladder(original: Path, scratch: Path, settings: dict, info: dict,
+                  target: float, tolerance: float, key: int) -> tuple:
+    """优先逼近封装后码率，调低预算无效时缩小；始终保留最低实际码率版本。"""
+    attempts = []
+    best = None
+    widths = (scale_widths(info["width"], settings) if settings["auto_scale"]
+              else [min(info["width"], settings["width"] or info["width"])])
+    level, at_width, budget = 0, 0, target
+    stop_reason = "attempt_limit"
+    for attempt in range(1, settings["max_attempts"] + 1):
+        width = widths[level]
+        active = {**settings, "width": width}
+        active["height"] = (math.ceil(info["height"] * width / info["width"] / 2) * 2
+                            if width < info["width"] else info["height"])
+        encoded = scratch / f"attempt-{attempt}.ivf"
+        candidate = scratch / f"attempt-{attempt}.dat"
+        # 每一档都从原片编码，要不然会重复压缩
+        encode(original, encoded, scratch, active, info, budget)
+        encoded_info = probe(encoded)
+        verify_encoded(encoded_info, info, active)
+        usm_io.mux(encoded, candidate, key)
+        size = candidate.stat().st_size
+        actual = kbps(size, encoded_info["duration"])
+        row = {"attempt": attempt, "encoder_kbps": budget, "actual_kbps": actual,
+               "bytes": size, "width": encoded_info["width"], "height": encoded_info["height"],
+               "fps": encoded_info["fps"], "scale": width / info["width"]}
+        previous_best = best
+        if best is None or actual < best[0]["actual_kbps"]:
+            best = (row, candidate, encoded, active)
+        # 只保留最佳候选与当前统计，防止多轮编码积累大量临时文件
+        if previous_best is not None and best is not previous_best:
+            previous_best[1].unlink()
+            previous_best[2].unlink()
+        if best[1] != candidate:
+            candidate.unlink()
+            encoded.unlink()
+        attempts.append(row)
+        at_width += 1
+        print(f"{width}×{encoded_info['height']} 第 {attempt} 轮：预算 {budget:.1f}，实际 {actual:.1f} kbps，"
+              f"{size / 1e6:.2f} MB", flush=True)
+        if actual <= target * (1 + tolerance):
+            stop_reason = "target_met"
+            break
+        plateau = (at_width >= 2 and actual >= attempts[-2]["actual_kbps"] * 0.98)
+        if at_width >= 2 and level + 1 < len(widths):
+            level += 1
+            at_width, budget = 0, target
+        elif plateau:
+            stop_reason = "minimum_size_plateau" if settings["auto_scale"] else "scaling_disabled_plateau"
+            break
+        else:
+            budget = max(1.0, next_budget(budget, actual, target))
+    row, candidate, encoded, active = best
+    selection = {"attempt": row["attempt"], "reason": "lowest_actual_bitrate", "stop_reason": stop_reason,
+                 "budget_policy": "best_effort", "budget_met": row["actual_kbps"] <= target * (1 + tolerance),
+                 "target_ratio": row["actual_kbps"] / target}
+    return candidate, encoded, active, attempts, selection
 
 
 def scan(a000: Path, encoding: str, ids: list[int] | None = None) -> dict:
@@ -194,14 +250,15 @@ def encode(source: Path, output: Path, scratch: Path, settings: dict,
     if settings["fps"] and Fraction(info["fps"]) > settings["fps"]:
         filters.append(f"fps={settings['fps']}")
     if settings["width"] and info["width"] > settings["width"]:
-        filters.extend([f"scale={settings['width']}:-2:flags=lanczos", "setsar=1"])
+        filters.extend([f"scale={settings['width']}:{settings.get('height', -2)}:flags=lanczos", "setsar=1"])
     fps = min(float(Fraction(info["fps"])), settings["fps"]) if settings["fps"] else float(Fraction(info["fps"]))
     base = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin", "-y", "-threads", "1",
             "-i", str(source), "-an"]
     if filters:
         base.extend(["-vf", ",".join(filters)])
     base.extend(["-c:v", "libvpx-vp9", "-b:v", str(round(bitrate * 1000)),
-                 "-qmin", "0", "-qmax", "63", "-deadline", "good", "-cpu-used", str(settings["speed"]),
+                 "-qmin", "0", "-qmax", str(settings["max_quantizer"]),
+                 "-deadline", "good", "-cpu-used", str(settings["speed"]),
                  "-threads", str(settings["threads"]), "-row-mt", "1", "-pix_fmt", "yuv420p",
                  "-g", str(max(1, round(fps * settings["gop"]))),
                  "-passlogfile", str(scratch / "vp9-pass")])
@@ -221,6 +278,8 @@ def verify_encoded(info: dict, source: dict, settings: dict) -> None:
         raise ValueError("输出分辨率或帧率不符")
     if not settings["width"] and info["height"] != source["height"]:
         raise ValueError("输出高度被意外修改")
+    if settings.get("height") and info["height"] != settings["height"]:
+        raise ValueError("输出高度不符")
     if abs(info["duration"] - source["duration"]) > 1 / float(expected_fps) + 0.002:
         raise ValueError("输出时长与原视频相差超过一帧")
 
@@ -246,6 +305,7 @@ def process_one(movie: dict, args, settings: dict) -> dict:
         scratch = Path(temporary)
         candidate = scratch / "candidate.dat"
         attempts = []
+        selection = None
         video = movie["videos"][0] if len(movie["videos"]) == 1 else None
         reason = None
         if movie["system"] and not args.include_system:
@@ -267,7 +327,9 @@ def process_one(movie: dict, args, settings: dict) -> dict:
                     or source_info["width"] != video["width"] or source_info["height"] != video["height"]):
                 raise ValueError("源视频 USM/IVF 参数不符")
             decode_check(original)
-        if controlled and movie["kbps"] <= args.bitrate * (1 + args.tolerance):
+        if (controlled and movie["kbps"] <= args.bitrate * (1 + args.tolerance)
+                and (not settings["fps"] or Fraction(source_info["fps"]) <= settings["fps"])
+                and (not settings["width"] or source_info["width"] <= settings["width"])):
             reason = "already_within_budget"
         if reason:
             if usm_io.sha256(source) != digest:
@@ -279,41 +341,14 @@ def process_one(movie: dict, args, settings: dict) -> dict:
             # 不认识的轨道原样保留，明确只声明逐字节校验，不能声称完成了解码验证。
             validation = "full_decode" if verification else "byte_copy_only"
         else:
-            budget = args.bitrate
-            active_settings = dict(settings)
-            encoded = scratch / "encoded.ivf"
-            for attempt in range(1, args.max_attempts + 1):
-                if STOP.is_set():
-                    raise RuntimeError("任务已取消")
-                encode(original, encoded, scratch, active_settings, source_info, budget)
-                encoded_info = probe(encoded)
-                verify_encoded(encoded_info, source_info, active_settings)
-                usm_io.mux(encoded, candidate, args.key)
-                actual = kbps(candidate.stat().st_size, encoded_info["duration"])
-                attempts.append({"attempt": attempt, "encoder_kbps": budget, "actual_kbps": actual,
-                                 "bytes": candidate.stat().st_size, "width": encoded_info["width"],
-                                 "height": encoded_info["height"], "fps": encoded_info["fps"]})
-                print(f"{source.name} 第 {attempt} 轮：预算 {budget:.1f} → 实际 {actual:.1f} kbps", flush=True)
-                if actual <= args.bitrate * (1 + args.tolerance):
-                    break
-                plateau = (len(attempts) >= 2 and attempts[-2]["width"] == encoded_info["width"]
-                           and actual >= attempts[-2]["actual_kbps"] * 0.98)
-                if settings["auto_scale"] and (actual > args.bitrate * 1.25 or plateau):
-                    width = smaller_width(encoded_info["width"], actual, args.bitrate, settings["min_width"])
-                    if width < encoded_info["width"]:
-                        active_settings["width"] = width
-                        budget = args.bitrate
-                        print(f"{source.name} 超标，已授权自动降低宽度至 {width}，从原片重新编码", flush=True)
-                        continue
-                budget = next_budget(budget, actual, args.bitrate)
-                if budget < 1:
-                    raise BudgetError("容器或视频最低开销已接近预算，请提高目标码率", attempts)
-            else:
-                raise BudgetError(f"{args.max_attempts} 轮后仍超标：{actual:.1f} kbps，取消发布"
-                                  "可尝试 --auto-scale、--width 720，或提高目标码率", attempts)
+            candidate, encoded, active_settings, attempts, selection = encode_ladder(
+                original, scratch, settings, source_info, args.bitrate, args.tolerance, args.key)
             verification = verify(candidate, args.key, scratch, "utf-8", usm_io.sha256(encoded))
             verify_encoded(verification, source_info, active_settings)
             reason, validation = "compressed", "roundtrip_and_full_decode"
+            if not selection["budget_met"]:
+                print(f"{source.name} 已尽力压缩（{selection['stop_reason']}），保留第 {selection['attempt']} 档，"
+                      f"接受 {verification['kbps']:.1f} kbps（高于目标）", flush=True)
         if usm_io.sha256(candidate) != digest and reason != "compressed":
             raise ValueError("原样复制摘要不符")
         # 读取来源摘要后再次确认，避免把正在被外部修改的 PV 标记为可续跑。
@@ -325,7 +360,8 @@ def process_one(movie: dict, args, settings: dict) -> dict:
                   "bytes": candidate.stat().st_size, "duration": duration,
                   "kbps": kbps(candidate.stat().st_size, duration), "controlled": controlled,
                   "status": reason, "validation": validation, "verification": verification,
-                  "attempts": attempts, "settings": settings, "resumed": False}
+                  "attempts": attempts, "selection": selection,
+                  "settings": settings, "resumed": False}
         if args.force:
             os.replace(candidate, destination)
         else:
@@ -344,6 +380,8 @@ def summarize(records: list[dict], target: float, tolerance: float) -> dict:
     all_actual = kbps(sum(r["bytes"] for r in video), sum(r["duration"] for r in video))
     unmeasured = [r["name"] for r in records if r["duration"] <= 0]
     over = [r["name"] for r in controlled if r["kbps"] > target * (1 + tolerance)]
+    accepted_over = [r["name"] for r in controlled if r["name"] in over
+                     and (r.get("selection") or {}).get("budget_policy") in ("soft", "best_effort")]
     return {"files": len(records), "source_bytes": sum(r["source_bytes"] for r in records),
             "output_bytes": sum(r["bytes"] for r in records), "controlled_files": len(controlled),
             "controlled_seconds": seconds, "controlled_kbps": actual,
@@ -352,6 +390,9 @@ def summarize(records: list[dict], target: float, tolerance: float) -> dict:
             "unmeasured_files": unmeasured,
             "preserved_files": [r["name"] for r in records if not r["controlled"]],
             "target_kbps": target, "tolerance": tolerance, "over_budget_files": over,
+            "far_over_budget_files": [r["name"] for r in controlled if r["kbps"] > target * 1.25],
+            "accepted_over_budget_files": accepted_over,
+            "strict_over_budget_files": [name for name in over if name not in accepted_over],
             "budget_met": bool(controlled) and not over and actual <= target * (1 + tolerance)}
 
 
@@ -361,6 +402,8 @@ def make_settings(args) -> dict:
             "tolerance": args.tolerance, "max_attempts": args.max_attempts,
             "min_duration": args.min_duration, "gop": args.gop, "threads": args.threads,
             "auto_scale": args.auto_scale, "min_width": args.min_width,
+            "min_scale": args.min_scale,
+            "max_quantizer": args.max_quantizer,
             "speed": args.speed, "encoding": args.encoding, "include_system": args.include_system,
             "unsupported": args.unsupported, "wannacri": version("WannaCRI"),
             "key_id": hashlib.sha256(str(args.key).encode()).hexdigest()}
@@ -406,7 +449,11 @@ def compress(args) -> int:
     print(f"完成 {len(results)}/{len(movies)}，输出 {summary['output_bytes'] / 1e9:.3f} GB；"
           f"视频整体 {summary['controlled_kbps']:.1f} kbps，"
           f"含保留文件 {summary['all_video_kbps']:.1f} kbps，失败 {len(failures)}", flush=True)
-    return 130 if cancelled else (1 if failures or summary["over_budget_files"] else 0)
+    print(f"码率超标但已接受 {len(summary['accepted_over_budget_files'])} 个", flush=True)
+    if summary["far_over_budget_files"]:
+        print(f"警告：{len(summary['far_over_budget_files'])} 个文件仍超过目标 25%，"
+              "请查看报告中的实际码率和停止原因，可增加 --max-attempts 或降低 --min-width", flush=True)
+    return 130 if cancelled else (1 if failures else 0)
 
 
 def check(args) -> int:
@@ -440,9 +487,11 @@ def check(args) -> int:
             failures.append({"name": name, "error": "生成物缺失"})
     summary = summarize(results, args.bitrate, args.tolerance)
     atomic_json(args.output / "check_report.json", {"summary": summary, "errors": failures,
-                                                  "valid": not failures and not summary["over_budget_files"]})
+                                                  "valid": not failures})
     print(f"整体 {summary['controlled_kbps']:.1f} kbps，超标 {len(summary['over_budget_files'])}，错误 {len(failures)}")
-    return 1 if failures or summary["over_budget_files"] else 0
+    if summary["accepted_over_budget_files"]:
+        print(f"其中 {len(summary['accepted_over_budget_files'])} 个已保留最佳结果；完整性检查通过不代表码率达标")
+    return 1 if failures else 0
 
 
 def main(argv=None) -> int:
@@ -460,17 +509,20 @@ def main(argv=None) -> int:
         if command != "scan":
             p.add_argument("--key", type=parse_key)
             p.add_argument("--bitrate", type=float, default=defaults["DEFAULT_BITRATE"] or "400", help="封装后目标平均码率，kbps")
-            p.add_argument("--tolerance", type=float, default=0.05, help="允许超出目标的比例，默认 0.05")
+            p.add_argument("--tolerance", type=float, default=0.02, help="允许超出目标的比例，默认 0.02")
         if command == "compress":
             p.add_argument("--fps", type=int, default=defaults["DEFAULT_FPS"] or "30", help="帧率上限，0 保持原帧率")
-            p.add_argument("--width", type=int, default=0, help="最大宽度，0 保持原分辨率")
-            p.add_argument("--auto-scale", action="store_true", help="明显超标时允许自动降分辨率")
-            p.add_argument("--min-width", type=int, default=400, help="自动降分辨率的宽度下限")
+            p.add_argument("--width", type=int, default=0, help="首轮最大宽度，0 从原尺寸开始")
+            p.add_argument("--auto-scale", action=argparse.BooleanOptionalAction, default=True,
+                           help="优先调低码率，仍超标则逐级缩小；--no-auto-scale 禁止缩小")
+            p.add_argument("--min-width", type=int, default=400, help="自动缩放的最小宽度，默认 400")
+            p.add_argument("--min-scale", type=float, default=0.0, help="额外的尺寸保留比例下限，默认 0，仅受 min-width 限制")
+            p.add_argument("--max-quantizer", type=int, default=63, help="量化上限，默认 63，允许更强压缩；降低此值会增大体积")
             p.add_argument("--workers", type=int, default=1)
             p.add_argument("--threads", type=int, default=4, help="每个编码器的线程数")
             p.add_argument("--speed", type=int, default=4, help="VP9 编码速度 0..5，低值更慢")
             p.add_argument("--gop", type=float, default=4, help="关键帧间隔秒数")
-            p.add_argument("--max-attempts", type=int, default=4)
+            p.add_argument("--max-attempts", type=int, default=24, help="最多编码轮次，默认 24，达标即停")
             p.add_argument("--min-duration", type=float, default=2, help="更短的视频原样保留")
             p.add_argument("--limit", type=int)
             p.add_argument("--include-system", action="store_true", help="也尝试压缩非数字命名的系统视频")
@@ -509,8 +561,10 @@ def main(argv=None) -> int:
             return check(args)
         if not (0 <= args.fps <= 120 and (args.width == 0 or 64 <= args.width <= 4096 and args.width % 2 == 0)
                 and 64 <= args.min_width <= 4096 and args.min_width % 2 == 0
+                and math.isfinite(args.min_scale) and 0 <= args.min_scale <= 1
+                and 0 <= args.max_quantizer <= 63
                 and 1 <= args.workers <= 16 and 1 <= args.threads <= 64 and 0 <= args.speed <= 5
-                and 1 <= args.max_attempts <= 10 and math.isfinite(args.gop) and 0.1 <= args.gop <= 60
+                and 1 <= args.max_attempts <= 40 and math.isfinite(args.gop) and 0.1 <= args.gop <= 60
                 and math.isfinite(args.min_duration) and 0 <= args.min_duration <= 60
                 and (args.limit is None or args.limit > 0)):
             raise ValueError("编码参数超出允许范围，请查看 compress --help")

@@ -2,7 +2,7 @@
 
 Compress BGA data (MovieData) for maimai DX custom server's StreamingAssets data.
 
-压缩 maimai DX 第三方服务器的BGA数据包，减小体积占用。
+压缩 maimai DX 数据包中 StreamingAssets 的BGA数据，减小体积占用。
 
 ## 运行
 
@@ -51,13 +51,17 @@ python compressor.py compress --ids 2059
 python compressor.py compress --bitrate 360 --output output-360
 python compressor.py check --bitrate 360 --output output-360
 
-# 保持原帧率，或按需降低宽度
+# 保持原帧率
 python compressor.py compress --fps 0 --output output-original-fps
-python compressor.py compress --width 720 --output output-720
 
-# 允许在明显超标时自动降低分辨率，最低降到 400 宽
-python compressor.py compress --auto-scale --output output-auto
+# 指定目标码率，使用新的输出目录
+python compressor.py compress --bitrate 400 --fps 30 --output output-400
+
+# 如需保持尺寸（可能无法达到码率目标）
+python compressor.py compress --no-auto-scale --output output-original-size
 ```
+
+自动缩放参数：`--min-width` 为宽度下限（默认 400）；`--min-scale` 可额外限制保留比例（默认 0，不限制）；`--max-attempts` 为最多编码轮次（默认 24）；`--max-quantizer` 默认为 63，降低此值会限制压缩强度、增大体积
 
 确认效果后，将生成的 `.dat` 复制到目标数据包的 MovieData 文件夹即可
 
